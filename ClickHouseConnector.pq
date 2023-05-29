@@ -4,14 +4,14 @@
 //
 
 [Version = "1.0.0"]
-section ClickHouseConnector;
+section ClickHouseODBC;
 
 
 // When set to true, additional trace information will be written out to the User log. 
 // This should be set to false before release. Tracing is done through a call to 
 // Diagnostics.LogValue(). When EnableTraceOutput is set to false, the call becomes a 
 // no-op and simply returns the original value.
-EnableTraceOutput = true;
+EnableTraceOutput = false;
 
 // TODO
 // add handling for SSL
@@ -121,8 +121,50 @@ Config_UseCastInsteadOfConvert = null; // true, false, null
 //
 Config_EnableDirectQuery = true;    // true, false
 
-[DataSource.Kind="ClickHouseConnector", Publish="ClickHouseConnector.Publish"]
-shared ClickHouseConnector.Contents = (server as text, port as number, database as text, optional unicode as logical, optional options as record) =>
+
+
+[DataSource.Kind="ClickHouseODBC", Publish="ClickHouseODBC.Publish"]
+shared ClickHouseODBC.Database = Value.ReplaceType(DatabaseImpl, DatabaseType);
+
+//For compatibility reasons
+[DataSource.Kind="ClickHouseConnector"]
+shared ClickHouseConnector.Contents = (server as text, optional port as number, optional database as text, optional unicode as logical, optional options as record) =>
+    let
+        contents = DatabaseImpl(server, port, database, options)
+    in contents;
+
+
+DatabaseType = type function (
+    server as (type text meta [
+        Documentation.FieldCaption = "Server or Url",
+        Documentation.FieldDescription = "Name of ClickHouse Server or Url",
+        Documentation.SampleValues = {"play.clickhouse.com", "https://play.clickhouse.com:443/"}        
+    ]),
+    optional port as (type number meta [
+        Documentation.FieldCaption = "Port",
+        Documentation.FieldDescription = "Port used by ClickHouse instance",
+        Documentation.SampleValues = {443, 8123}  
+    ]),
+    optional database as (type text meta [
+        Documentation.FieldCaption = "Database",
+        Documentation.FieldDescription = "Name of ClickHouse database",
+        Documentation.SampleValues = {"default"}  
+    ]),    
+    optional advoptions as (type text meta [
+        Documentation.FieldCaption = "Options",
+        Documentation.FieldDescription = "Additional connection string options separated by semicolon",
+        Documentation.SampleValues = {"Timeout=600;UseUnicode=true","UseUnicode=true"}
+    ]))
+    as table meta [
+        Documentation.Name = "ClickHouseODBC",
+        Documentation.LongDescription = "ClickHouse connector for ODBC",
+        Documentation.Examples = {[
+            Description = "Returns a navigation table with list of play.clickhouse.com tables, that can be folded",
+            Code = "ClickHouseODBC.Database(""https://play.clickhouse.com"")"
+        ]}
+    ];
+
+DatabaseImpl = (server as text, optional port as number, optional database as text, optional advoptions as any) =>
     let
         // Many data sources accept an optional 'options' record that allows users to change
         // default behaviors about the connection, such as connection timeout. Use this map
@@ -131,14 +173,30 @@ shared ClickHouseConnector.Contents = (server as text, port as number, database 
         // the data source function.
         ValidOptionsMap = #table(
             {"Name","Type","Description","Default","Validate"},
-            {
-                {"ApplicationName", type nullable text, "Enter a value to use as the Application Name in the SQL traces", null, each _ = null or _ <> null},
-                {"ConnectionTimeout", type nullable number, "non-negative integers", null, each _ = null or (_ >= 0 and Number.RoundDown(_) = _)}
+            {                
+                {"Timeout", type nullable number, "non-negative integers", null, each _ = null or (_ >= 0 and Number.RoundDown(_) = _)},
+                {"VerifyConnectionEarly", type nullable text, "Verify the connection and credentials during SQLConnect. Can be off or on", null, each _ = null or _ <> null},
+                {"PrivateKeyFile", type nullable text, "Path to private key file", null, each _ = null or _ <> null},
+                {"CertificateFile", type nullable text, "Path to certificate file", null, each _ = null or _ <> null},
+                {"CALocation", type nullable text, "Path to the file or directory containing the CA/root certificates", null, each _ = null or _ <> null},
+                {"HugeIntAsString", type nullable text, "Report integer column types that may underflow or overflow 64-bit signed integer. Can be off ot on", null, each _ = null or _ <> null},
+                {"DriverLog", type nullable text, "Enable or disable the extended driver logging. Can be off or on", null, each _ = null or _ <> null},
+                {"DriverLogFile", type nullable text, "Path to the extended driver log file. Can be off or on", null, each _ = null or _ <> null},
+                {"UseUnicode", type nullable logical, "Use Unicode driver if true or ANSI if false", null, each _ = null or _ <> null},
+                {"SSLMode", type nullable text, "Certificate verification method (used by TLS/SSL connections, ignored in Windows), one of: allow, prefer, require", null, each _ = null or _ <> null}
+                //{"ApplicationName", type nullable text, "Enter a value to use as the Application Name in the SQL traces", null, each _ = null or _ <> null},                
                 // Some data sources may support setting separate timeout values for Connect and Command timeouts
-                // {"CommandTimeout", type nullable number, "non-negative integers", null, each _ = null or (_ >= 0 and Number.RoundDown(_) = _)}
+                //{"CommandTimeout", type nullable number, "non-negative integers", null, each _ = null or (_ >= 0 and Number.RoundDown(_) = _)}
             }
         ),
-
+        
+        options = 
+        if(Type.Is(Value.Type(advoptions), type record)) 
+            then advoptions 
+        else if Type.Is(Value.Type(advoptions), type nullable text) 
+            then RecordFromString(advoptions,ValidOptionsMap) 
+        else [],
+        
         ValidatedOptions = ValidateOptions(options, ValidOptionsMap),
         //
         // Handle credentials
@@ -148,16 +206,19 @@ shared ClickHouseConnector.Contents = (server as text, port as number, database 
         // handled here as an example. 
         //
         Credential = Extension.CurrentCredential(),
-		CredentialConnectionString =
-            if Credential[AuthenticationKind]? = "UsernamePassword" then
-                // set connection string parameters used for basic authentication
-                [ UID = Credential[Username], PWD = Credential[Password] ]
-                //[ UID = Credential[Username] ]
-            else if (Credential[AuthenticationKind]? = "Windows") then
-                // set connection string parameters used for windows/kerberos authentication
-                [ Trusted_Connection="Yes" ]
-            else
-                error Error.Record("Error", "Unhandled authentication kind: " & Credential[AuthenticationKind]?),
+        encryptionEnabled = Credential[EncryptConnection]? = true,
+		CredentialConnectionString = 
+        if encryptionEnabled then 
+            [ 
+                //SSLMode = "allow", 
+                UID = Credential[Username], 
+                PWD = Credential[Password] 
+            ] 
+        else 
+            [
+                UID = Credential[Username],
+                PWD = Credential[Password] 
+            ],
         
         //
         // Configuration options for the call to Odbc.DataSource
@@ -226,27 +287,62 @@ shared ClickHouseConnector.Contents = (server as text, port as number, database 
                     Value.ReplaceType(toTable, Value.Type(source))
             else
                 source,
-               
+        
+        driver = if(ValidatedOptions[UseUnicode]?=null or not ValidatedOptions[UseUnicode]?) then Config_DriverName_ANSI else Config_DriverName_Unicode,
         //
         // Connection string settings
         //
-        ConnectionString = [
-            // At minimum you need to specify the ODBC Driver to use.
-            Driver = if(unicode=null or unicode) then Config_DriverName_Unicode else Config_DriverName_ANSI,
+        ConnectionString = 
+            if(Text.StartsWith(server,"http://",Comparer.OrdinalIgnoreCase)) or (Text.StartsWith(server,"https://",Comparer.OrdinalIgnoreCase)) 
+            then 
+                 [
+                    // At minimum you need to specify the ODBC Driver to use.
+                    Driver = driver,
+                    //Driver = Config_DriverName_Unicode,
 
-            // Specify custom properties for your ODBC Driver here. 
-            // The fields below are appropriate for the SQL Server ODBC Driver. The
-            // names might be different for your data source.            
-            Server = server,
-            Port = port,
-            Database = database,
-            ApplicationIntent = "ReadOnly",
+                    // Specify custom properties for your ODBC Driver here. 
+                    // The fields below are appropriate for the SQL Server ODBC Driver. The
+                    // names might be different for your data source.    
+                    Url = server,
+                    Port = try Uri.Parts(server)[Port] otherwise port ,
+                    Database = database,  
+                    
+                    
+                    // These fields come from the options record, so they might be null.
+                    // A later step will strip all null values from the connection string.                    
+                    #"Timeout" = ValidatedOptions[Timeout]?,
+                    #"VerifyConnectionEarly" = ValidatedOptions[VerifyConnectionEarly]?,
+                    #"PrivateKeyFile" = ValidatedOptions[PrivateKeyFile]?,
+                    #"CertificateFile" = ValidatedOptions[CertificateFile]?,
+                    #"CALocation" = ValidatedOptions[CALocation]?,
+                    #"HugeIntAsString" = ValidatedOptions[HugeIntAsString]?,                    
+                    #"DriverLog" = ValidatedOptions[DriverLog]?,
+                    #"DriverLogFile" =  ValidatedOptions[DriverLogFile]?
+                ]
+            else 
+                 [
+                    // At minimum you need to specify the ODBC Driver to use.
+                    Driver = driver,
+                    //Driver = Config_DriverName_Unicode,
 
-            // These fields come from the options record, so they might be null.
-            // A later step will strip all null values from the connection string.
-            #"Application Name" = ValidatedOptions[ApplicationName]?,
-            #"Connect Timeout" = ValidatedOptions[ConnectionTimeout]?
-        ],
+                    // Specify custom properties for your ODBC Driver here. 
+                    // The fields below are appropriate for the SQL Server ODBC Driver. The
+                    // names might be different for your data source.                    
+                    Server = server,
+                    Port = port,
+                    Database = database,                    
+
+                    // These fields come from the options record, so they might be null.
+                    // A later step will strip all null values from the connection string.                    
+                    #"Timeout" = ValidatedOptions[Timeout]?,
+                    #"VerifyConnectionEarly" = ValidatedOptions[VerifyConnectionEarly]?,
+                    #"PrivateKeyFile" = ValidatedOptions[PrivateKeyFile]?,
+                    #"CertificateFile" = ValidatedOptions[CertificateFile]?,
+                    #"CALocation" = ValidatedOptions[CALocation]?,
+                    #"HugeIntAsString" = ValidatedOptions[HugeIntAsString]?,                    
+                    #"DriverLog" = ValidatedOptions[DriverLog]?,
+                    #"DriverLogFile" =  ValidatedOptions[DriverLogFile]?
+                ],
          // Remove null fields from the ConnectionString
         ConnectionStringNoNulls = Record.SelectFields(ConnectionString, Table.SelectRows(Record.ToTable(ConnectionString), each [Value] <> null)[Name]),        
         OdbcDatasource = Odbc.DataSource(ConnectionStringNoNulls, [
@@ -257,35 +353,82 @@ shared ClickHouseConnector.Contents = (server as text, port as number, database 
             // Allow upconversion / resizing of numeric and string types
             TolerateConcatOverflow = true,
             // Enables connection pooling via the system ODBC manager
-            ClientConnectionPooling = true,
+            ClientConnectionPooling = false,
 
             // These values should be set by previous steps
             CredentialConnectionString = CredentialConnectionString,
             SqlCapabilities = SqlCapabilities,
             SQLColumns = SQLColumns,
             SQLGetInfo = SQLGetInfo,
-            SQLGetTypeInfo = SQLGetTypeInfo
+            SQLGetTypeInfo = SQLGetTypeInfo            
         ]),
-        OdbcDatasourceFiltered = Table.SelectRows(OdbcDatasource, each [Name] = database) // non-queryable system table
+        OdbcDatasourceFiltered = Table.SelectRows(OdbcDatasource, each [Name] = database or database = null) // non-queryable system table
     in
         OdbcDatasourceFiltered;
-    
+
+
+
+// Data Source Kind description
+ClickHouseODBC = [
+     TestConnection = (dataSourcePath) => 
+        let
+            json = Json.Document(dataSourcePath),
+            server = json[server],
+            port = json[port],
+            database = json[database],
+            advoptions = json[advoptions]
+        in
+            { "ClickHouseODBC.Database", server, port, database, advoptions }, 
+    Authentication = [
+        // Key = [],
+        UsernamePassword = []
+        // Windows = [],
+        //Implicit = []
+    ],
+    SupportsEncryption = true,
+    Label = Extension.LoadString("DataSourceLabel")
+];
+
+// Data Source UI publishing description
+ClickHouseODBC.Publish = [
+    Beta = true,
+    Category = "Database",
+    ButtonText = { Extension.LoadString("ButtonTitle"), Extension.LoadString("ButtonHelp") },
+    LearnMoreUrl = "https://powerbi.microsoft.com/",
+    SupportsDirectQuery = Config_EnableDirectQuery,
+    SourceImage = ClickHouseODBC.Icons,
+    SourceTypeImage = ClickHouseODBC.Icons
+];
+
+ClickHouseODBC.Icons = [
+    Icon16 = { Extension.Contents("ClickHouseConnector16.png"), Extension.Contents("ClickHouseConnector20.png"), Extension.Contents("ClickHouseConnector24.png"), Extension.Contents("ClickHouseConnector32.png") },
+    Icon32 = { Extension.Contents("ClickHouseConnector32.png"), Extension.Contents("ClickHouseConnector40.png"), Extension.Contents("ClickHouseConnector48.png"), Extension.Contents("ClickHouseConnector64.png") }
+];
 
 // Data Source Kind description
 ClickHouseConnector = [
+     TestConnection = (dataSourcePath) => 
+        let
+            json = Json.Document(dataSourcePath),
+            server = json[server],
+            port = json[port],
+            database = json[database]
+        in
+            { "ClickHouseConnector.Contents", server, port, database }, 
     Authentication = [
         // Key = [],
-        UsernamePassword = [],
+        UsernamePassword = []
         // Windows = [],
-        Implicit = []
+        //Implicit = []
     ],
+    SupportsEncryption = true,
     Label = Extension.LoadString("DataSourceLabel")
 ];
 
 // Data Source UI publishing description
 ClickHouseConnector.Publish = [
     Beta = true,
-    Category = "Other",
+    Category = "Database",
     ButtonText = { Extension.LoadString("ButtonTitle"), Extension.LoadString("ButtonHelp") },
     LearnMoreUrl = "https://powerbi.microsoft.com/",
     SupportsDirectQuery = Config_EnableDirectQuery,
@@ -298,6 +441,33 @@ ClickHouseConnector.Icons = [
     Icon32 = { Extension.Contents("ClickHouseConnector32.png"), Extension.Contents("ClickHouseConnector40.png"), Extension.Contents("ClickHouseConnector48.png"), Extension.Contents("ClickHouseConnector64.png") }
 ];
 
+
+//build options record
+RecordFromString = (string as nullable text, optional validOptionsMap as table) =>
+    let
+        tbl = Table.FromValue(string),   
+        tbl1 = Table.ExpandListColumn(Table.TransformColumns(tbl, {{"Value", Splitter.SplitTextByDelimiter(";", QuoteStyle.Csv), let itemType = (type nullable text) meta [Serialized.Text = true] in type {itemType}}}), "Value"),
+        tbl2 = Table.SplitColumn(tbl1, "Value", Splitter.SplitTextByDelimiter("=", QuoteStyle.Csv), {"Name", "Value"}),
+        tbl3 = Table.Distinct(tbl2, {"Name"}),
+        tbl4 = Table.SelectRows(tbl3, each [Name] <> null and [Name] <> ""),
+        rec = Record.FromTable(tbl4),
+        result = 
+        if(validOptionsMap = null and rec=[]) then 
+            rec
+        else
+            let
+                totransform = Table.SelectRows(validOptionsMap, each (not Type.Is([Type],type nullable text) and not Type.Is([Type],type text))),
+                transtable = Table.AddColumn(totransform , "Value", each 
+                                                                if (Type.Is([Type], type nullable number)) or (Type.Is([Type], type number)) 
+                                                                    then { [Name], Number.FromText}
+                                                                else if (Type.Is([Type], type nullable logical)) or (Type.Is([Type], type logical)) 
+                                                                    then { [Name], Logical.FromText}
+                                                                else null
+                ), 
+                rc = Record.TransformFields(rec,Table.Column(transtable,"Value"),MissingField.Ignore) 
+            in rc        
+    in
+        result;
 
 // build settings based on configuration variables
 BuildOdbcConfig = () as record =>
