@@ -9,7 +9,7 @@ Download and install ClickHouse ODBC driver from https://github.com/ClickHouse/c
 
 Create a [Documents]\Power BI Desktop\Custom Connectors directory.
 
-Download ClickHouseConnector.mez and place it in that directory.
+Download ClickHouseConnector.mez from https://github.com/belyaevvo/ClickHouseConnector/releases and place it in that directory.
 
 Open Power BI Desktop and enable loading unsigned connectors (File > Options and settings > Options > Security > Data Extensions > Allow any extension to load without warning or validation)
 
